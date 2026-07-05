@@ -1376,3 +1376,82 @@ class TestConfigLoadErrors:
         parser = GlobalConfigDictParser()
         config = DictConfig({"my_server": {"resources_servers": {"x": {"entrypoint": "app.py", "domain": "other"}}}})
         parser.raise_on_no_server_instances(config)
+
+
+class TestReplicasExpansion:
+    def _proxy_and_backend_config(self, model_server, replicas=None) -> DictConfig:
+        backend = {"responses_api_models": {"local_vllm_model": {"entrypoint": "app.py", "model": "m"}}}
+        if replicas is not None:
+            backend["replicas"] = replicas
+        return DictConfig(
+            {
+                "judge_backend": backend,
+                "judge_proxy": {
+                    "responses_api_models": {
+                        "local_vllm_model_proxy": {"entrypoint": "app.py", "model_server": model_server}
+                    }
+                },
+            }
+        )
+
+    def test_expand_basic_and_rewrite_single_ref(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = self._proxy_and_backend_config({"type": "responses_api_models", "name": "judge_backend"}, replicas=3)
+        parser.expand_replicated_servers(config)
+
+        assert "judge_backend" not in config
+        for i in range(3):
+            replica = config[f"judge_backend_{i}"]
+            assert "replicas" not in replica
+            assert replica["responses_api_models"]["local_vllm_model"]["model"] == "m"
+
+        refs = config["judge_proxy"]["responses_api_models"]["local_vllm_model_proxy"]["model_server"]
+        assert [r["name"] for r in refs] == ["judge_backend_0", "judge_backend_1", "judge_backend_2"]
+        assert all(r["type"] == "responses_api_models" for r in refs)
+
+    def test_expand_splices_ref_inside_list(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = self._proxy_and_backend_config(
+            [
+                {"type": "responses_api_models", "name": "other_server"},
+                {"type": "responses_api_models", "name": "judge_backend"},
+            ],
+            replicas=2,
+        )
+        parser.expand_replicated_servers(config)
+        refs = config["judge_proxy"]["responses_api_models"]["local_vllm_model_proxy"]["model_server"]
+        assert [r["name"] for r in refs] == ["other_server", "judge_backend_0", "judge_backend_1"]
+
+    def test_replicas_one_keeps_name_and_strips_key(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = self._proxy_and_backend_config({"type": "responses_api_models", "name": "judge_backend"}, replicas=1)
+        parser.expand_replicated_servers(config)
+        assert "replicas" not in config["judge_backend"]
+        ref = config["judge_proxy"]["responses_api_models"]["local_vllm_model_proxy"]["model_server"]
+        assert ref["name"] == "judge_backend"
+
+    def test_invalid_replicas_value_raises(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = self._proxy_and_backend_config({"type": "responses_api_models", "name": "judge_backend"}, replicas=0)
+        with raises(ValueError, match="must be an int >= 1"):
+            parser.expand_replicated_servers(config)
+
+    def test_replica_name_collision_raises(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = self._proxy_and_backend_config({"type": "responses_api_models", "name": "judge_backend"}, replicas=2)
+        config["judge_backend_0"] = {"responses_api_models": {"x": {"entrypoint": "app.py"}}}
+        with raises(ValueError, match="already exists"):
+            parser.expand_replicated_servers(config)
+
+    def test_replicas_on_non_server_entry_raises(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = DictConfig({"weird": {"replicas": 2, "some_key": {"a": 1}}})
+        with raises(ValueError, match="does not look like a server entry"):
+            parser.expand_replicated_servers(config)
+
+    def test_config_without_replicas_untouched(self) -> None:
+        parser = GlobalConfigDictParser()
+        config = self._proxy_and_backend_config({"type": "responses_api_models", "name": "judge_backend"})
+        before = OmegaConf.to_container(config)
+        parser.expand_replicated_servers(config)
+        assert OmegaConf.to_container(config) == before

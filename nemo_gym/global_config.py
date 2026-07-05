@@ -75,6 +75,8 @@ UV_VENV_DIR_KEY_NAME = "uv_venv_dir"
 INHERIT_FROM_KEY_NAME = "_inherit_from"
 COPY_KEY_NAME = "_copy"
 DELETE_KEY_KEY_NAME = "_delete_key"
+REPLICAS_KEY_NAME = "replicas"
+SERVER_TYPE_KEY_NAMES = ("responses_api_models", "resources_servers", "responses_api_agents")
 
 # Sentinel returned by _recursive_index_dict_using_path when a referenced swap/copy/inherit path is
 # unset (a '???' leaf or ancestor). Distinct object so callers can branch on it without mistaking a
@@ -343,6 +345,100 @@ Duplicate config paths:
 
         return disallowed_ports
 
+    def expand_replicated_servers(self, global_config_dict: DictConfig) -> None:
+        """Expand every top-level server entry carrying ``replicas: N`` into N copies.
+
+        ``foo: {replicas: N, <server_type>: {...}}`` becomes ``foo_0 .. foo_{N-1}`` (each copy
+        without the ``replicas`` key; the original entry is removed), and every ServerRef in the
+        merged config that points at ``foo`` is rewritten to the list of replica refs — spliced
+        in place when the ref already sits inside a list. Consumers whose ref fields accept a
+        single ref only will then fail their own pydantic validation loudly, which is intended:
+        a single-ref field cannot address N replicas.
+
+        ``replicas: 1`` just strips the key, so the entry keeps its original name; configs
+        without the key are untouched.
+        """
+        replicated: dict = {}  # (server_type, original_name) -> [replica names]
+        with open_dict(global_config_dict):
+            for key in [k for k in global_config_dict.keys() if k not in NEMO_GYM_RESERVED_TOP_LEVEL_KEYS]:
+                entry = global_config_dict.get(key)
+                if not isinstance(entry, DictConfig) or REPLICAS_KEY_NAME not in entry:
+                    continue
+                replicas = entry.pop(REPLICAS_KEY_NAME)
+                if not isinstance(replicas, int) or replicas < 1:
+                    raise ValueError(f"Server '{key}': `{REPLICAS_KEY_NAME}` must be an int >= 1, got {replicas!r}")
+                if replicas == 1:
+                    continue
+                server_types = [t for t in SERVER_TYPE_KEY_NAMES if t in entry]
+                if len(server_types) != 1:
+                    raise ValueError(
+                        f"Server '{key}' has `{REPLICAS_KEY_NAME}: {replicas}` but does not look like a "
+                        f"server entry (expected exactly one of {SERVER_TYPE_KEY_NAMES} as a key)."
+                    )
+                replica_names = [f"{key}_{i}" for i in range(replicas)]
+                for name in replica_names:
+                    if name in global_config_dict:
+                        raise ValueError(
+                            f"Cannot expand server '{key}' into {replicas} replicas: an entry named "
+                            f"'{name}' already exists in the merged config."
+                        )
+                for name in replica_names:
+                    global_config_dict[name] = deepcopy(entry)
+                del global_config_dict[key]
+                replicated[(server_types[0], key)] = replica_names
+
+        if not replicated:
+            return
+
+        num_rewritten = self._rewrite_refs_to_replicas(global_config_dict, replicated)
+        for (server_type, key), names in replicated.items():
+            rich.print(
+                f"[global-config] Expanded {server_type} server '{key}' into {len(names)} replicas "
+                f"('{names[0]}' .. '{names[-1]}'); rewrote {num_rewritten} server ref(s) in total."
+            )
+
+    def _replica_refs_for(self, value, replicated) -> "Optional[List[dict]]":
+        """If ``value`` is a ServerRef dict pointing at a replicated server, return the replica refs."""
+        if not isinstance(value, DictConfig) or set(value.keys()) != {"type", "name"}:
+            return None
+        maybe_ref = is_server_ref(value)
+        if maybe_ref is None:
+            return None
+        replica_names = replicated.get((maybe_ref.type, maybe_ref.name))
+        if replica_names is None:
+            return None
+        return [{"type": maybe_ref.type, "name": name} for name in replica_names]
+
+    def _rewrite_refs_to_replicas(self, node, replicated) -> int:
+        """Recursively replace refs to replicated servers; returns the number of refs rewritten."""
+        num_rewritten = 0
+        if isinstance(node, DictConfig):
+            for key in list(node.keys()):
+                value = node.get(key)
+                replica_refs = self._replica_refs_for(value, replicated)
+                if replica_refs is not None:
+                    with open_dict(node):
+                        node[key] = replica_refs
+                    num_rewritten += 1
+                elif isinstance(value, ListConfig):
+                    new_items = []
+                    changed = False
+                    for item in value:
+                        item_refs = self._replica_refs_for(item, replicated)
+                        if item_refs is not None:
+                            new_items.extend(item_refs)
+                            changed = True
+                            num_rewritten += 1
+                        else:
+                            num_rewritten += self._rewrite_refs_to_replicas(item, replicated)
+                            new_items.append(item)
+                    if changed:
+                        with open_dict(node):
+                            node[key] = new_items
+                else:
+                    num_rewritten += self._rewrite_refs_to_replicas(value, replicated)
+        return num_rewritten
+
     def collect_missing_value_paths(self, config: DictConfig) -> List[str]:
         """Return the dotted paths of every unset (OmegaConf '???') leaf, without raising.
 
@@ -579,6 +675,10 @@ Pass each config with --config (it builds the list for you), e.g.:
         # a '???' in a deleted or overwritten branch is not reported. Otherwise the first unset
         # value surfaces as an opaque MissingMandatoryValue deep in the pipeline.
         self.raise_on_missing_values(global_config_dict)
+
+        # Expand `replicas: N` server entries into N independent copies (and rewrite refs to
+        # them) before any server filtering/validation sees the config.
+        self.expand_replicated_servers(global_config_dict)
 
         # TODO @bxyu-nvidia: We need a better way of handling dummy model configs
         with open_dict(global_config_dict):
