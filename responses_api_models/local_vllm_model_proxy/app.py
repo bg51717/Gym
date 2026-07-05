@@ -13,14 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-This responses_api_models server is only used to proxy to an existing LocalVLLMModel server so we don't need to duplicate GPU resources.
+This responses_api_models server is only used to proxy to one or more existing LocalVLLMModel servers so we don't need to duplicate GPU resources.
+
+`model_server` accepts a single ref or a list of refs (mirroring `base_url`'s str-or-list
+convention). With several refs, the proxy aggregates every upstream's inner vLLM URL and the
+inherited VLLMModel client round-robins new sessions across them — N independent single-node
+instances behave as one logical model server.
 """
 
 from time import sleep
 from typing import List, Union
 
 import requests
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
@@ -34,35 +39,54 @@ class LocalVLLMModelProxyServerConfig(VLLMModelConfig):
     api_key: str = "dummy"  # pragma: allowlist secret
     model: str = "dummy"
 
-    model_server: ModelServerRef
+    # A single upstream ref, or a list of them to fan out across several upstream
+    # LocalVLLMModel servers (all must serve the same model). Normalized to a list.
+    model_server: Union[ModelServerRef, List[ModelServerRef]]
+
+    @model_validator(mode="after")
+    def _normalize_model_server(self) -> "LocalVLLMModelProxyServerConfig":
+        if isinstance(self.model_server, ModelServerRef):
+            self.model_server = [self.model_server]
+        if not self.model_server:
+            raise ValueError("`model_server` must contain at least one ref.")
+        return self
 
 
 class LocalVLLMModelProxyServer(VLLMModel):
     config: LocalVLLMModelProxyServerConfig
 
     def setup_webserver(self):
-        model_server_name = self.config.model_server.name
+        base_urls: List[str] = []
+        for ref in self.config.model_server:
+            model_server_name = ref.name
 
-        print(f"Waiting for LocalVLLMModelServer `{model_server_name}` spinup")
+            print(f"Waiting for LocalVLLMModelServer `{model_server_name}` spinup")
 
-        while self.server_client.poll_for_status(model_server_name) != "success":
-            # Sleep for 10s by default
-            sleep(10)
+            while self.server_client.poll_for_status(model_server_name) != "success":
+                # Sleep for 10s by default
+                sleep(10)
 
-        model_server_config_dict = get_first_server_config_dict(
-            self.server_client.global_config_dict, model_server_name
-        )
-        model_server_base_url = self.server_client._build_server_base_url(model_server_config_dict)
-        response = requests.get(
-            f"{model_server_base_url}/get_inner_vllm_config",
-        )
-        assert response.ok
+            model_server_config_dict = get_first_server_config_dict(
+                self.server_client.global_config_dict, model_server_name
+            )
+            model_server_base_url = self.server_client._build_server_base_url(model_server_config_dict)
+            response = requests.get(
+                f"{model_server_base_url}/get_inner_vllm_config",
+            )
+            assert response.ok
 
-        response_dict = response.json()
+            response_dict = response.json()
 
-        self.config.base_url = response_dict["base_url"]
-        self.config.api_key = response_dict["api_key"]
-        self.config.model = response_dict["model"]
+            inner_base_url = response_dict["base_url"]
+            base_urls.extend(inner_base_url if isinstance(inner_base_url, list) else [inner_base_url])
+            self.config.api_key = response_dict["api_key"]
+            assert self.config.model in ("dummy", response_dict["model"]), (
+                f"All upstream servers must serve the same model; got `{response_dict['model']}` "
+                f"from `{model_server_name}` after `{self.config.model}`"
+            )
+            self.config.model = response_dict["model"]
+
+        self.config.base_url = base_urls
 
         # Reset clients after base_url config
         self._post_init()

@@ -14,6 +14,8 @@
 # limitations under the License.
 from unittest.mock import MagicMock
 
+import pytest
+
 import responses_api_models.local_vllm_model_proxy.app
 from nemo_gym.server_utils import ServerClient
 from responses_api_models.local_vllm_model_proxy.app import (
@@ -73,3 +75,93 @@ class TestApp:
         assert expected_model == actual_model
 
         assert len(server._clients) == 2
+
+    def _setup_multi_server(self):
+        config = LocalVLLMModelProxyServerConfig(
+            host="0.0.0.0",
+            port=8081,
+            entrypoint="",
+            name="",
+            return_token_id_information=False,
+            uses_reasoning_parser=True,
+            model_server=[
+                {"type": "responses_api_models", "name": "backend 0"},
+                {"type": "responses_api_models", "name": "backend 1"},
+            ],
+        )
+        return LocalVLLMModelProxyServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+    def _mock_inner_vllm_config_response(self, base_url, model: str) -> MagicMock:
+        response = MagicMock()
+        response.json.return_value = {
+            "base_url": base_url,
+            "api_key": "my api key",  # pragma: allowlist secret
+            "model": model,
+        }
+        return response
+
+    def test_setup_webserver_multi_upstream(self, monkeypatch) -> None:
+        server = self._setup_multi_server()
+
+        sleep_mock = MagicMock()
+        monkeypatch.setattr(responses_api_models.local_vllm_model_proxy.app, "sleep", sleep_mock)
+
+        server.server_client.poll_for_status.side_effect = ["success", "error", "success"]
+        server.server_client.global_config_dict = None
+
+        monkeypatch.setattr(
+            responses_api_models.local_vllm_model_proxy.app,
+            "get_first_server_config_dict",
+            MagicMock(),
+        )
+
+        requests_mock = MagicMock()
+        # One upstream reports a list, the other a plain string — both shapes must aggregate.
+        requests_mock.get.side_effect = [
+            self._mock_inner_vllm_config_response(["abcd"], "my model"),
+            self._mock_inner_vllm_config_response("defg", "my model"),
+        ]
+        monkeypatch.setattr(responses_api_models.local_vllm_model_proxy.app, "requests", requests_mock)
+
+        server.setup_webserver()
+
+        assert sleep_mock.call_count == 1
+        assert server.config.model == "my model"
+        assert server.config.base_url == ["abcd", "defg"]
+        assert len(server._clients) == 2
+
+    def test_setup_webserver_multi_upstream_model_mismatch(self, monkeypatch) -> None:
+        server = self._setup_multi_server()
+
+        monkeypatch.setattr(responses_api_models.local_vllm_model_proxy.app, "sleep", MagicMock())
+
+        server.server_client.poll_for_status.side_effect = ["success", "success"]
+        server.server_client.global_config_dict = None
+
+        monkeypatch.setattr(
+            responses_api_models.local_vllm_model_proxy.app,
+            "get_first_server_config_dict",
+            MagicMock(),
+        )
+
+        requests_mock = MagicMock()
+        requests_mock.get.side_effect = [
+            self._mock_inner_vllm_config_response(["abcd"], "my model"),
+            self._mock_inner_vllm_config_response(["defg"], "other model"),
+        ]
+        monkeypatch.setattr(responses_api_models.local_vllm_model_proxy.app, "requests", requests_mock)
+
+        with pytest.raises(AssertionError, match="same model"):
+            server.setup_webserver()
+
+    def test_empty_model_server_list_rejected(self) -> None:
+        with pytest.raises(ValueError, match="at least one ref"):
+            LocalVLLMModelProxyServerConfig(
+                host="0.0.0.0",
+                port=8081,
+                entrypoint="",
+                name="",
+                return_token_id_information=False,
+                uses_reasoning_parser=True,
+                model_server=[],
+            )
